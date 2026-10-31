@@ -18,6 +18,13 @@ const float PVPZONE_PUSH_IN = 4.0
 const float PVPZONE_WARN_INTERVAL = 1.5
 const float PVPZONE_PLANAR_TOLERANCE = 2.0 // points further than this from the first plane -> split into triangles
 
+// closure grid cell states
+const int CELL_UNKNOWN = 0   // never reached from outside after the flood = enclosed
+const int CELL_BORDER = 1    // a border / preset wall passes through it
+const int CELL_WORLD = 2     // solid map geometry
+const int CELL_OUTSIDE = 3   // reached from the grid edge = outside
+const int CELL_WORLD_EDGE = 4 // solid map geometry touching the outside (lethal, so nobody hides in it)
+
 global struct PvPZoneArea
 {
 	array<vector> poly
@@ -61,9 +68,26 @@ struct
 	float tileStep = 0.0
 	array<entity> wallPieces
 	array<entity> previewPieces
-	array<vector> pieceCenters // for spawn checks
 	float pieceRadius = 0.0
 	table<entity, bool> blockedSpawns
+
+	// closure: preset walls (mod.json) + admin borders (/border) -> enclosed space
+	array<array<vector> > presetSurfaces
+	array<array<vector> > borderSurfaces
+	array<array<entity> > borderPieces
+	bool closureReady = false
+	bool closureComputing = false
+	int closureVersion = 0
+	vector gridOrigin
+	float cell = 64.0
+	int nx = 0
+	int ny = 0
+	int nz = 0
+	bool openTop = false
+	array<int> cellState // CELL_* below
+	int enclosedCells = 0
+	string closureStatus = "not computed"
+	bool thinkStarted = false
 
 	// per player
 	table<entity, vector> lastSafe
@@ -101,6 +125,8 @@ void function PvPZone_Init()
 
 	if ( GetConVarBool( "pvpzone_edit" ) )
 		PvPZone_RegisterEditCommands()
+
+	AddCallback_OnReceivedSayTextMessage( PvPZone_OnChat )
 }
 
 // ===================================================================================
@@ -142,9 +168,9 @@ void function PvPZone_AddSpawn( string mapName, vector origin, vector angles )
 
 bool function PvPZone_IsPointInPlayArea( vector point )
 {
-	if ( !file.hasBoundary )
+	if ( !PvPZone_HasPlayArea() )
 		return true
-	return PvPZone_PointInArea( point, file.boundary )
+	return PvPZone_IsSafe( point )
 }
 
 PvPZoneArea function PvPZone_MakeArea( array<vector> points, float minZ, float maxZ, float oobTime )
@@ -451,7 +477,6 @@ int function PvPZone_TilePlanar( array<vector> pts, array<entity> outPieces, int
 				if ( centerPieces )
 					origin = target - PvPZone_RotateLocal( localCenter, ang )
 				outPieces.append( PvPZone_CreateWallPiece( origin, ang ) )
-				file.pieceCenters.append( target )
 				made++
 			}
 		}
@@ -503,6 +528,7 @@ void function PvPZone_BuildConfiguredWalls()
 		return
 
 	array<array<vector> > surfaces = PvPZone_ParseSurfaces( data )
+	file.presetSurfaces = surfaces
 	int budget = GetConVarInt( "pvpzone_wall_max_pieces" )
 	int total = 0
 	foreach ( array<vector> surf in surfaces )
@@ -530,9 +556,24 @@ bool function PvPZone_KnownMap( string mapName )
 }
 
 // spawnpoints inside or touching a wall piece are never used
+array<entity> function PvPZone_AllPieces()
+{
+	array<entity> all = clone file.wallPieces
+	foreach ( array<entity> pieces in file.borderPieces )
+		all.extend( pieces )
+	return all
+}
+
 void function PvPZone_ComputeBlockedSpawns()
 {
-	if ( file.pieceCenters.len() == 0 )
+	file.blockedSpawns.clear()
+	array<vector> centers
+	foreach ( entity piece in PvPZone_AllPieces() )
+	{
+		if ( IsValid( piece ) )
+			centers.append( piece.GetWorldSpaceCenter() )
+	}
+	if ( centers.len() == 0 )
 		return
 
 	float r = file.pieceRadius + 40.0
@@ -543,7 +584,7 @@ void function PvPZone_ComputeBlockedSpawns()
 		foreach ( entity sp in GetEntArrayByClass_Expensive( cls ) )
 		{
 			vector o = sp.GetOrigin() + < 0, 0, 36 >
-			foreach ( vector c in file.pieceCenters )
+			foreach ( vector c in centers )
 			{
 				vector d = o - c
 				if ( d.x * d.x + d.y * d.y + d.z * d.z < rSq )
@@ -589,17 +630,50 @@ void function PvPZone_Setup_Threaded()
 		PvPZone_ComputeBlockedSpawns()
 	}
 
-	PvPZone_LoadBoundaryFromConVar()
-	if ( !file.hasBoundary )
-	{
-		printt( "[PvPZone] no play area for " + GetMapName() + " (walls only, nothing is lethal)" )
-		return
-	}
-
 	file.fallMode = strip( GetConVarString( "pvpzone_boundary_mode" ) ).tolower() != "push"
 	file.ceilingKill = GetConVarBool( "pvpzone_ceiling_kill" )
-	printt( "[PvPZone] play area: " + file.boundary.poly.len() + " points, z " + int( file.boundary.minZ ) + " .. " + int( file.boundary.maxZ )
-		+ ", outside = " + ( file.fallMode ? "fall death" : "push back" ) )
+	file.openTop = GetConVarBool( "pvpzone_closure_open_top" )
+
+	PvPZone_LoadBoundaryFromConVar()
+	if ( file.hasBoundary )
+		printt( "[PvPZone] flat play area: " + file.boundary.poly.len() + " points, z " + int( file.boundary.minZ ) + " .. " + int( file.boundary.maxZ ) )
+
+	// admin borders saved by /border, then closure detection over presets + borders
+	NSLoadFile( PvPZone_BorderFileName(), PvPZone_OnBordersLoaded, PvPZone_OnBordersMissing )
+
+	if ( GetConVarBool( "pvpzone_cull_props" ) && file.hasBoundary )
+		PvPZone_CullOutside()
+
+	PvPZone_RefreshSafeSpawns()
+	if ( !file.thinkStarted )
+	{
+		file.thinkStarted = true
+		thread PvPZone_Think()
+	}
+}
+
+// any closed space or flat play area defined?
+bool function PvPZone_HasPlayArea()
+{
+	return file.hasBoundary || file.closureReady
+}
+
+// inside the outermost closed space (or the flat play area) = safe; everything else = fell out of the map
+bool function PvPZone_IsSafe( vector p )
+{
+	if ( file.hasBoundary && PvPZone_PointInArea( p, file.boundary ) )
+		return true
+	if ( file.closureReady && PvPZone_InClosure( p ) )
+		return true
+	return false
+}
+
+void function PvPZone_RefreshSafeSpawns()
+{
+	file.safeSpawns.clear()
+	file.titanSafeSpawns.clear()
+	if ( !PvPZone_HasPlayArea() )
+		return
 
 	foreach ( entity spawnpoint in GetEntArrayByClass_Expensive( "info_spawnpoint_human" ) )
 	{
@@ -616,11 +690,6 @@ void function PvPZone_Setup_Threaded()
 	printt( "[PvPZone] " + file.safeSpawns.len() + " pilot spawns inside the play area" )
 	if ( file.safeSpawns.len() < 8 )
 		printt( "[PvPZone] WARNING: few spawns inside the area, add more with pvpzone_spawn / PvPZone_AddSpawn" )
-
-	if ( GetConVarBool( "pvpzone_cull_props" ) )
-		PvPZone_CullOutside()
-
-	thread PvPZone_Think()
 }
 
 // pvpzone_boundary_<map> = "x y z, x y z, x y z, ..." (corners in order, on the ground)
@@ -698,11 +767,11 @@ bool function PvPZone_SpawnRule( entity spawnpoint, int team )
 	if ( spawnpoint in file.blockedSpawns )
 		return false
 
-	if ( !file.hasBoundary )
+	if ( !PvPZone_HasPlayArea() )
 		return true
 
-	vector p = spawnpoint.GetOrigin() + < 0, 0, 8 >
-	if ( !PvPZone_PointInArea( p, file.boundary ) )
+	vector p = spawnpoint.GetOrigin() + < 0, 0, 36 >
+	if ( !PvPZone_IsSafe( p ) )
 		return false
 
 	foreach ( PvPZoneArea zone in file.oobZones )
@@ -763,7 +832,7 @@ void function PvPZone_Think()
 	{
 		WaitFrame()
 
-		if ( GetGameState() >= eGameState.Postmatch )
+		if ( GetGameState() >= eGameState.Postmatch || !PvPZone_HasPlayArea() )
 			continue
 
 		foreach ( entity player in GetPlayerArray() )
@@ -791,7 +860,7 @@ void function PvPZone_CheckNPCs()
 			continue
 		if ( npc.IsTitan() && npc.e.isHotDropping )
 			continue
-		if ( PvPZone_PointInArea( npc.GetOrigin(), file.boundary ) )
+		if ( PvPZone_IsSafe( npc.GetOrigin() + < 0, 0, 36 > ) )
 			continue
 
 		if ( npc.IsTitan() )
@@ -832,7 +901,7 @@ void function PvPZone_CheckPlayer( entity player )
 		return
 
 	vector pos = player.GetOrigin()
-	if ( PvPZone_PointInArea( pos, file.boundary ) )
+	if ( PvPZone_IsSafe( pos + < 0, 0, 36 > ) ) // body centre
 	{
 		if ( player in file.lastSafe )
 			file.lastSafe[ player ] = pos
@@ -846,7 +915,7 @@ void function PvPZone_CheckPlayer( entity player )
 	if ( file.fallMode && player in file.lastSafe )
 	{
 		// above the ceiling but still over the area: not lethal unless pvpzone_ceiling_kill 1
-		if ( !file.ceilingKill && pos.z > file.boundary.maxZ && PvPZone_InsideXY( pos, file.boundary ) )
+		if ( file.hasBoundary && !file.ceilingKill && pos.z > file.boundary.maxZ && PvPZone_InsideXY( pos, file.boundary ) )
 		{
 			vector vel = player.GetVelocity()
 			if ( vel.z > 0.0 )
@@ -870,6 +939,15 @@ void function PvPZone_PushBack( entity player, vector pos )
 
 	vector target = file.lastSafe[ player ]
 	vector vel = player.GetVelocity()
+
+	if ( !file.hasBoundary )
+	{
+		// closure only: back to the last safe spot
+		player.SetOrigin( target )
+		player.SetVelocity( < 0, 0, 0 > )
+		PvPZone_WarnEdge( player )
+		return
+	}
 
 	if ( pos.z > file.boundary.maxZ || pos.z < file.boundary.minZ )
 	{
@@ -1156,7 +1234,18 @@ bool function PvPZone_CC_Print( entity player, array<string> args )
 	string line
 	if ( kind == "oob" )
 	{
-		float seconds = args.len() > 1 ? args[1].tofloat() : 5.0
+		float seconds = 5.0
+		if ( args.len() > 1 )
+		{
+			try
+			{
+				seconds = args[1].tofloat()
+			}
+			catch ( ex )
+			{
+				seconds = 5.0
+			}
+		}
 		line = "PvPZone_AddOOBZone( \"" + GetMapName() + "\", " + arr + ", " + int( zLow - 128 ) + ", " + int( zHigh + 1024 ) + ", " + seconds + " )"
 	}
 	else
@@ -1204,4 +1293,587 @@ void function PvPZone_DrawFlatPoly( array<vector> poly, float z, int r, int g, i
 		DebugDrawLine( a, c, r, g, b, true, 15.0 )
 		DebugDrawLine( a, a + < 0, 0, 256 >, r, g, b, true, 15.0 )
 	}
+}
+
+// ===================================================================================
+// Admin borders (/border) and closed-space detection
+// ===================================================================================
+//
+// Every preset wall (mod.json) and admin border is rasterised into a voxel grid, solid map geometry is
+// sampled with hull traces, then a flood fill starts from the edge of the grid. Every cell the flood
+// reaches is outside. Cells it can't reach are enclosed by borders/walls/map geometry. This automatically
+// takes the OUTERMOST closed shell: inner closed spaces are never reached from outside, so they are safe too.
+
+string function PvPZone_BorderFileName()
+{
+	return "borders_" + GetMapName() + ".txt"
+}
+
+string function PvPZone_SerializeSurfaces( array<array<vector> > surfaces )
+{
+	string out = ""
+	for ( int s = 0; s < surfaces.len(); s++ )
+	{
+		if ( s > 0 )
+			out += "; "
+		for ( int i = 0; i < surfaces[s].len(); i++ )
+			out += ( i > 0 ? ", " : "" ) + PvPZone_PointStr( surfaces[s][i] )
+	}
+	return out
+}
+
+void function PvPZone_OnBordersLoaded( string data )
+{
+	array<array<vector> > surfaces = PvPZone_ParseSurfaces( data )
+	foreach ( array<vector> surf in surfaces )
+		PvPZone_AddBorderSurface( surf )
+	printt( "[PvPZone] loaded " + surfaces.len() + " admin borders from " + PvPZone_BorderFileName() )
+	PvPZone_ComputeBlockedSpawns()
+	PvPZone_RecomputeClosure()
+}
+
+void function PvPZone_OnBordersMissing()
+{
+	PvPZone_RecomputeClosure()
+}
+
+void function PvPZone_AddBorderSurface( array<vector> pts )
+{
+	array<entity> pieces
+	if ( file.wallModelOk )
+		PvPZone_BuildSurface( pts, pieces, GetConVarInt( "pvpzone_wall_max_pieces" ) )
+	file.borderSurfaces.append( pts )
+	file.borderPieces.append( pieces )
+}
+
+void function PvPZone_RemoveBorder( int index )
+{
+	foreach ( entity piece in file.borderPieces[ index ] )
+	{
+		if ( IsValid( piece ) )
+			piece.Destroy()
+	}
+	file.borderSurfaces.remove( index )
+	file.borderPieces.remove( index )
+}
+
+void function PvPZone_SaveBorders()
+{
+	NSSaveFile( PvPZone_BorderFileName(), PvPZone_SerializeSurfaces( file.borderSurfaces ) )
+}
+
+// ---------------- closure grid ----------------
+
+void function PvPZone_RecomputeClosure()
+{
+	thread PvPZone_RecomputeClosure_Threaded()
+}
+
+int function PvPZone_CellIndex( vector p, vector origin, float cell, int nx, int ny, int nz )
+{
+	int ix = int( floor( ( p.x - origin.x ) / cell ) )
+	int iy = int( floor( ( p.y - origin.y ) / cell ) )
+	int iz = int( floor( ( p.z - origin.z ) / cell ) )
+	if ( ix < 0 || iy < 0 || iz < 0 || ix >= nx || iy >= ny || iz >= nz )
+		return -1
+	return ( iz * ny + iy ) * nx + ix
+}
+
+void function PvPZone_MarkBorder( array<int> st, vector p, vector origin, float cell, int nx, int ny, int nz )
+{
+	int idx = PvPZone_CellIndex( p, origin, cell, nx, ny, nz )
+	if ( idx >= 0 )
+		st[ idx ] = CELL_BORDER
+}
+
+// mark every cell a planar polygon passes through, one cell thick on each side so the flood can't leak
+void function PvPZone_RasterPlanar( array<vector> pts, array<int> st, vector origin, float cell, int nx, int ny, int nz )
+{
+	vector p0 = pts[0]
+	vector e1 = pts[1] - p0
+	vector normal = < 0, 0, 0 >
+	for ( int i = 2; i < pts.len(); i++ )
+	{
+		vector c = CrossProduct( e1, pts[i] - p0 )
+		if ( Length( c ) > 1.0 )
+		{
+			normal = Normalize( c )
+			break
+		}
+	}
+	if ( Length( normal ) < 0.5 || Length( e1 ) < 1.0 )
+		return
+
+	vector u = Normalize( e1 )
+	vector v = CrossProduct( normal, u )
+	vector off = normal * ( cell * 0.5 )
+
+	array<float> xs
+	array<float> ys
+	float minA = 0.0
+	float maxA = 0.0
+	float minB = 0.0
+	float maxB = 0.0
+	foreach ( vector p in pts )
+	{
+		float a = DotProduct( p - p0, u )
+		float b = DotProduct( p - p0, v )
+		xs.append( a )
+		ys.append( b )
+		minA = min( minA, a )
+		maxA = max( maxA, a )
+		minB = min( minB, b )
+		maxB = max( maxB, b )
+	}
+
+	float step = cell * 0.4
+	float edgeSq = ( step * 0.5 ) * ( step * 0.5 )
+	int countA = int( ceil( ( maxA - minA ) / step ) ) + 1
+	int countB = int( ceil( ( maxB - minB ) / step ) ) + 1
+	for ( int ia = 0; ia < countA; ia++ )
+	{
+		float a = min( minA + ia * step, maxA )
+		for ( int ib = 0; ib < countB; ib++ )
+		{
+			float b = min( minB + ib * step, maxB )
+			if ( !PvPZone_PointInPoly2D( a, b, xs, ys ) && PvPZone_DistToPolyEdgeSq2D( a, b, xs, ys ) > edgeSq )
+				continue
+			vector p = p0 + u * a + v * b
+			PvPZone_MarkBorder( st, p, origin, cell, nx, ny, nz )
+			PvPZone_MarkBorder( st, p + off, origin, cell, nx, ny, nz )
+			PvPZone_MarkBorder( st, p - off, origin, cell, nx, ny, nz )
+		}
+	}
+
+	// outline, so edges shared by two surfaces always meet
+	for ( int i = 0; i < pts.len(); i++ )
+	{
+		vector a = pts[i]
+		vector b = pts[ ( i + 1 ) % pts.len() ]
+		int steps = maxint( 1, int( ceil( Length( b - a ) / step ) ) )
+		for ( int k = 0; k <= steps; k++ )
+		{
+			vector p = a + ( b - a ) * ( float( k ) / float( steps ) )
+			PvPZone_MarkBorder( st, p, origin, cell, nx, ny, nz )
+			PvPZone_MarkBorder( st, p + off, origin, cell, nx, ny, nz )
+			PvPZone_MarkBorder( st, p - off, origin, cell, nx, ny, nz )
+		}
+	}
+}
+
+void function PvPZone_RasterSurface( array<vector> pts, array<int> st, vector origin, float cell, int nx, int ny, int nz )
+{
+	vector cross = CrossProduct( pts[1] - pts[0], pts[2] - pts[0] )
+	bool planar = Length( cross ) > 1.0
+	if ( planar )
+	{
+		vector normal = Normalize( cross )
+		foreach ( vector p in pts )
+		{
+			if ( fabs( DotProduct( p - pts[0], normal ) ) > PVPZONE_PLANAR_TOLERANCE )
+			{
+				planar = false
+				break
+			}
+		}
+	}
+
+	if ( planar )
+	{
+		PvPZone_RasterPlanar( pts, st, origin, cell, nx, ny, nz )
+		return
+	}
+	for ( int i = 1; i < pts.len() - 1; i++ )
+	{
+		array<vector> tri = [ pts[0], pts[i], pts[i + 1] ]
+		PvPZone_RasterPlanar( tri, st, origin, cell, nx, ny, nz )
+	}
+}
+
+void function PvPZone_RecomputeClosure_Threaded()
+{
+	file.closureVersion++
+	int version = file.closureVersion
+	file.closureComputing = true
+	file.closureStatus = "computing"
+
+	array<array<vector> > surfaces = clone file.presetSurfaces
+	surfaces.extend( file.borderSurfaces )
+	if ( surfaces.len() == 0 )
+	{
+		array<int> empty = []
+		PvPZone_FinishClosure( version, false, "no borders or preset walls", empty, < 0, 0, 0 >, 64.0, 0, 0, 0, 0 )
+		return
+	}
+
+	// bounds of every point
+	float x0 = surfaces[0][0].x
+	float x1 = x0
+	float y0 = surfaces[0][0].y
+	float y1 = y0
+	float z0 = surfaces[0][0].z
+	float z1 = z0
+	foreach ( array<vector> surf in surfaces )
+	{
+		foreach ( vector p in surf )
+		{
+			x0 = min( x0, p.x )
+			x1 = max( x1, p.x )
+			y0 = min( y0, p.y )
+			y1 = max( y1, p.y )
+			z0 = min( z0, p.z )
+			z1 = max( z1, p.z )
+		}
+	}
+
+	// grid: 2 free cells around everything (no margin on top in open-top mode)
+	float cell = max( 16.0, GetConVarFloat( "pvpzone_closure_cell" ) )
+	int maxCells = maxint( 10000, GetConVarInt( "pvpzone_closure_max_cells" ) )
+	int nx = 0
+	int ny = 0
+	int nz = 0
+	for ( ;; )
+	{
+		nx = int( ceil( ( x1 - x0 ) / cell ) ) + 4
+		ny = int( ceil( ( y1 - y0 ) / cell ) ) + 4
+		// open top: the grid stops at the highest border point, so air can't flow over the walls
+		if ( file.openTop )
+			nz = maxint( 3, int( floor( ( z1 - z0 ) / cell ) ) + 2 )
+		else
+			nz = int( ceil( ( z1 - z0 ) / cell ) ) + 4
+		if ( nx * ny * nz <= maxCells )
+			break
+		cell *= 1.25
+	}
+	vector origin = < x0 - 2.0 * cell, y0 - 2.0 * cell, z0 - 2.0 * cell >
+	int total = nx * ny * nz
+	printt( "[PvPZone] closure grid " + nx + " x " + ny + " x " + nz + " (" + total + " cells of " + int( cell ) + ")" )
+
+	array<int> st
+	st.resize( total, CELL_UNKNOWN )
+
+	// 1) borders and preset walls
+	foreach ( array<vector> surf in surfaces )
+	{
+		PvPZone_RasterSurface( surf, st, origin, cell, nx, ny, nz )
+		WaitFrame()
+		if ( version != file.closureVersion )
+			return
+	}
+
+	// 2) flood fill from the grid edge (6-connected); map geometry is tested only where the flood arrives
+	bool useWorld = GetConVarBool( "pvpzone_closure_world" )
+	float h = cell * 0.45
+	vector hullMins = < -h, -h, -h >
+	vector hullMaxs = < h, h, h >
+	int nxy = nx * ny
+
+	array<int> stack
+	for ( int iz = 0; iz < nz; iz++ )
+	{
+		for ( int iy = 0; iy < ny; iy++ )
+		{
+			for ( int ix = 0; ix < nx; ix++ )
+			{
+				bool edge = ix == 0 || iy == 0 || iz == 0 || ix == nx - 1 || iy == ny - 1 || ( iz == nz - 1 && !file.openTop )
+				if ( !edge )
+					continue
+				int idx = ( iz * ny + iy ) * nx + ix
+				if ( st[ idx ] == CELL_UNKNOWN )
+				{
+					st[ idx ] = CELL_OUTSIDE
+					stack.append( idx )
+				}
+			}
+		}
+	}
+
+	int work = 0
+	while ( stack.len() > 0 )
+	{
+		int idx = stack.pop()
+		int ix = idx % nx
+		int iy = ( idx / nx ) % ny
+		int iz = idx / nxy
+
+		if ( useWorld )
+		{
+			vector c = origin + < ( ix + 0.5 ) * cell, ( iy + 0.5 ) * cell, ( iz + 0.5 ) * cell >
+			TraceResults tr = TraceHull( c, c, hullMins, hullMaxs, null, TRACE_MASK_NPCWORLDSTATIC, TRACE_COLLISION_GROUP_NONE )
+			if ( tr.startSolid )
+			{
+				st[ idx ] = CELL_WORLD
+				work++
+				continue
+			}
+		}
+
+		if ( ix > 0 && st[ idx - 1 ] == CELL_UNKNOWN )
+		{
+			st[ idx - 1 ] = CELL_OUTSIDE
+			stack.append( idx - 1 )
+		}
+		if ( ix < nx - 1 && st[ idx + 1 ] == CELL_UNKNOWN )
+		{
+			st[ idx + 1 ] = CELL_OUTSIDE
+			stack.append( idx + 1 )
+		}
+		if ( iy > 0 && st[ idx - nx ] == CELL_UNKNOWN )
+		{
+			st[ idx - nx ] = CELL_OUTSIDE
+			stack.append( idx - nx )
+		}
+		if ( iy < ny - 1 && st[ idx + nx ] == CELL_UNKNOWN )
+		{
+			st[ idx + nx ] = CELL_OUTSIDE
+			stack.append( idx + nx )
+		}
+		if ( iz > 0 && st[ idx - nxy ] == CELL_UNKNOWN )
+		{
+			st[ idx - nxy ] = CELL_OUTSIDE
+			stack.append( idx - nxy )
+		}
+		if ( iz < nz - 1 && st[ idx + nxy ] == CELL_UNKNOWN )
+		{
+			st[ idx + nxy ] = CELL_OUTSIDE
+			stack.append( idx + nxy )
+		}
+
+		work++
+		if ( work % 1500 == 0 )
+		{
+			WaitFrame() // spread the work, no server hitch
+			if ( version != file.closureVersion )
+				return
+		}
+	}
+
+	// 3) count enclosed cells; map geometry touching the outside becomes lethal so nobody hides in it
+	int enclosed = 0
+	for ( int idx = 0; idx < total; idx++ )
+	{
+		if ( st[ idx ] == CELL_UNKNOWN )
+		{
+			enclosed++
+			continue
+		}
+		if ( st[ idx ] != CELL_WORLD )
+			continue
+
+		int ix = idx % nx
+		int iy = ( idx / nx ) % ny
+		int iz = idx / nxy
+		if ( ( ix > 0 && st[ idx - 1 ] == CELL_OUTSIDE ) || ( ix < nx - 1 && st[ idx + 1 ] == CELL_OUTSIDE )
+			|| ( iy > 0 && st[ idx - nx ] == CELL_OUTSIDE ) || ( iy < ny - 1 && st[ idx + nx ] == CELL_OUTSIDE )
+			|| ( iz > 0 && st[ idx - nxy ] == CELL_OUTSIDE ) || ( iz < nz - 1 && st[ idx + nxy ] == CELL_OUTSIDE ) )
+			st[ idx ] = CELL_WORLD_EDGE
+
+		if ( idx % 20000 == 0 )
+		{
+			WaitFrame()
+			if ( version != file.closureVersion )
+				return
+		}
+	}
+
+	if ( enclosed == 0 )
+	{
+		string hint = file.openTop ? "" : " (no roof? add a ceiling border or set pvpzone_closure_open_top 1)"
+		array<int> empty = []
+		PvPZone_FinishClosure( version, false, "NOT closed: the outside reaches every cell" + hint, empty, origin, cell, nx, ny, nz, 0 )
+		return
+	}
+
+	float volume = enclosed * cell * cell * cell
+	PvPZone_FinishClosure( version, true, "closed: " + enclosed + " cells (~" + int( volume / 1000000.0 ) + " million units^3)", st, origin, cell, nx, ny, nz, enclosed )
+}
+
+void function PvPZone_FinishClosure( int version, bool ok, string status, array<int> st, vector origin, float cell, int nx, int ny, int nz, int enclosed )
+{
+	if ( version != file.closureVersion )
+		return
+
+	file.closureComputing = false
+	file.closureStatus = status
+	file.closureReady = ok
+	if ( ok )
+	{
+		file.cellState = st
+		file.gridOrigin = origin
+		file.cell = cell
+		file.nx = nx
+		file.ny = ny
+		file.nz = nz
+		file.enclosedCells = enclosed
+	}
+	else
+	{
+		array<int> empty = []
+		file.cellState = empty
+	}
+
+	printt( "[PvPZone] closure " + status )
+	PvPZone_RefreshSafeSpawns()
+	foreach ( entity player in GetPlayerArray() )
+	{
+		if ( PvPZone_IsAdmin( player ) )
+			PvPZone_Tell( player, "[border] " + status )
+	}
+}
+
+bool function PvPZone_InClosure( vector p )
+{
+	int ix = int( floor( ( p.x - file.gridOrigin.x ) / file.cell ) )
+	int iy = int( floor( ( p.y - file.gridOrigin.y ) / file.cell ) )
+	int iz = int( floor( ( p.z - file.gridOrigin.z ) / file.cell ) )
+	if ( ix < 0 || iy < 0 || iz < 0 || ix >= file.nx || iy >= file.ny )
+		return false
+	if ( iz >= file.nz )
+	{
+		if ( !file.openTop )
+			return false
+		iz = file.nz - 1 // open top: above the walls counts as the column below
+	}
+
+	int s = file.cellState[ ( iz * file.ny + iy ) * file.nx + ix ]
+	return s == CELL_UNKNOWN || s == CELL_BORDER || s == CELL_WORLD
+}
+
+// ---------------- /border chat command ----------------
+
+bool function PvPZone_IsAdmin( entity player )
+{
+	if ( !IsValid( player ) )
+		return false
+	string uid = player.GetUID()
+	foreach ( string a in split( GetConVarString( "pvpzone_admins" ), ", " ) )
+	{
+		if ( strip( a ) == uid )
+			return true
+	}
+	return GetConVarBool( "pvpzone_edit" ) // edit mode: everyone may draw (private testing only)
+}
+
+ClServer_MessageStruct function PvPZone_OnChat( ClServer_MessageStruct message )
+{
+	array<string> args = split( strip( message.message ), " " )
+	if ( args.len() == 0 || args[0].tolower() != "/border" )
+		return message
+
+	message.shouldBlock = true
+	entity player = message.player
+	if ( !IsValid( player ) )
+		return message
+
+	if ( !PvPZone_IsAdmin( player ) )
+	{
+		PvPZone_Tell( player, "no permission. Your UID is " + player.GetUID() + " (server owner adds it to pvpzone_admins)" )
+		return message
+	}
+
+	args.remove( 0 )
+	PvPZone_BorderCommand( player, args )
+	return message
+}
+
+void function PvPZone_BorderCommand( entity player, array<string> args )
+{
+	string cmd = args.len() > 0 ? args[0].tolower() : "help"
+	array<string> none = []
+
+	if ( cmd == "add" )
+	{
+		PvPZone_CC_Add( player, none )
+	}
+	else if ( cmd == "here" )
+	{
+		PvPZone_CC_AddPos( player, none )
+	}
+	else if ( cmd == "undo" )
+	{
+		PvPZone_CC_Undo( player, none )
+	}
+	else if ( cmd == "clear" )
+	{
+		PvPZone_CC_Clear( player, none )
+	}
+	else if ( cmd == "done" )
+	{
+		array<vector> pts = PvPZone_GetEditPoints( player )
+		if ( pts.len() < 3 )
+		{
+			PvPZone_Tell( player, "need at least 3 points (have " + pts.len() + ")" )
+			return
+		}
+		PvPZone_AddBorderSurface( clone pts )
+		pts.clear()
+		PvPZone_SaveBorders()
+		PvPZone_ComputeBlockedSpawns()
+		PvPZone_RecomputeClosure()
+		PvPZone_Tell( player, "border #" + file.borderSurfaces.len() + " saved, checking closure..." )
+	}
+	else if ( cmd == "list" )
+	{
+		PvPZone_Tell( player, file.presetSurfaces.len() + " preset walls, " + file.borderSurfaces.len() + " borders" )
+		for ( int i = 0; i < file.borderSurfaces.len(); i++ )
+			PvPZone_Tell( player, "#" + ( i + 1 ) + ": " + file.borderSurfaces[i].len() + " points, first " + PvPZone_PointStr( file.borderSurfaces[i][0] ) )
+	}
+	else if ( cmd == "del" )
+	{
+		int n = 0
+		if ( args.len() > 1 )
+		{
+			try
+			{
+				n = args[1].tointeger()
+			}
+			catch ( ex )
+			{
+				n = 0
+			}
+		}
+		if ( n < 1 || n > file.borderSurfaces.len() )
+		{
+			PvPZone_Tell( player, "usage: /border del <1-" + file.borderSurfaces.len() + ">" )
+			return
+		}
+		PvPZone_RemoveBorder( n - 1 )
+		PvPZone_SaveBorders()
+		PvPZone_ComputeBlockedSpawns()
+		PvPZone_RecomputeClosure()
+		PvPZone_Tell( player, "border #" + n + " removed, checking closure..." )
+	}
+	else if ( cmd == "delall" )
+	{
+		while ( file.borderSurfaces.len() > 0 )
+			PvPZone_RemoveBorder( 0 )
+		PvPZone_SaveBorders()
+		PvPZone_ComputeBlockedSpawns()
+		PvPZone_RecomputeClosure()
+		PvPZone_Tell( player, "all borders removed" )
+	}
+	else if ( cmd == "check" )
+	{
+		PvPZone_Tell( player, "closure: " + file.closureStatus + ( file.hasBoundary ? " | flat play area: on" : "" ) )
+		PvPZone_Tell( player, "you are " + ( PvPZone_IsSafe( player.GetOrigin() + < 0, 0, 36 > ) ? "INSIDE (safe)" : ( PvPZone_HasPlayArea() ? "OUTSIDE (lethal)" : "free (no play area yet)" ) ) )
+	}
+	else if ( cmd == "show" )
+	{
+		foreach ( array<vector> surf in file.presetSurfaces )
+			PvPZone_DrawOutline( surf, 0, 255, 0 )
+		foreach ( array<vector> surf in file.borderSurfaces )
+			PvPZone_DrawOutline( surf, 0, 200, 255 )
+		PvPZone_DrawOutline( PvPZone_GetEditPoints( player ), 255, 220, 0 )
+		PvPZone_Tell( player, "outlines drawn for 15s: green = preset, blue = border, yellow = current points" )
+	}
+	else
+	{
+		PvPZone_Tell( player, "/border add (crosshair) | here (eye pos) | undo | clear | done | list | del <n> | delall | check | show" )
+	}
+}
+
+void function PvPZone_DrawOutline( array<vector> pts, int r, int g, int b )
+{
+	for ( int i = 0; i < pts.len(); i++ )
+		DebugDrawLine( pts[i], pts[ ( i + 1 ) % pts.len() ], r, g, b, true, 15.0 )
 }

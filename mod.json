@@ -1,7 +1,7 @@
 {
 	"Name": "PvPZone",
 	"Description": "Server-side: build solid energy walls from 3D points (any angle) to fence off part of a large map for small-arena PvP. Optional script boundary, out-of-bounds countdown zones, in-area spawns.",
-	"Version": "0.4.0",
+	"Version": "0.5.0",
 	"LoadPriority": 2,
 	"RequiredOnClient": false,
 	"ConVars": [
@@ -40,6 +40,26 @@
 		{
 			"Name": "pvpzone_wall_max_pieces",
 			"DefaultValue": "1500"
+		},
+		{
+			"Name": "pvpzone_admins",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_closure_cell",
+			"DefaultValue": "64"
+		},
+		{
+			"Name": "pvpzone_closure_max_cells",
+			"DefaultValue": "400000"
+		},
+		{
+			"Name": "pvpzone_closure_world",
+			"DefaultValue": "1"
+		},
+		{
+			"Name": "pvpzone_closure_open_top",
+			"DefaultValue": "0"
 		},
 		{
 			"Name": "pvpzone_boundary_mode",
