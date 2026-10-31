@@ -1,7 +1,7 @@
 {
 	"Name": "PvPZone",
 	"Description": "Server-side: build solid energy walls from 3D points (any angle) to fence off part of a large map for small-arena PvP. Optional script boundary, out-of-bounds countdown zones, in-area spawns.",
-	"Version": "0.3.0",
+	"Version": "0.4.0",
 	"LoadPriority": 2,
 	"RequiredOnClient": false,
 	"ConVars": [
@@ -40,6 +40,22 @@
 		{
 			"Name": "pvpzone_wall_max_pieces",
 			"DefaultValue": "1500"
+		},
+		{
+			"Name": "pvpzone_boundary_mode",
+			"DefaultValue": "fall"
+		},
+		{
+			"Name": "pvpzone_boundary_below",
+			"DefaultValue": "512"
+		},
+		{
+			"Name": "pvpzone_boundary_above",
+			"DefaultValue": "3000"
+		},
+		{
+			"Name": "pvpzone_ceiling_kill",
+			"DefaultValue": "0"
 		},
 		{
 			"Name": "pvpzone_warn_text",
@@ -147,6 +163,98 @@
 		},
 		{
 			"Name": "pvpzone_walls_mp_lf_uma",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_angel_city",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_black_water_canal",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_coliseum",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_coliseum_column",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_colony02",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_complex3",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_crashsite3",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_drydock",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_eden",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_forwardbase_kodai",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_glitch",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_grave",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_homestead",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_relic02",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_rise",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_thaw",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_wargames",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_lf_deck",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_lf_meadow",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_lf_stacks",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_lf_township",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_lf_traffic",
+			"DefaultValue": ""
+		},
+		{
+			"Name": "pvpzone_boundary_mp_lf_uma",
 			"DefaultValue": ""
 		}
 	],

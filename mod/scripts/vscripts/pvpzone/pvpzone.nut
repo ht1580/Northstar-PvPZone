@@ -3,8 +3,9 @@
 //  - Energy walls: any number of surfaces, each defined by 3D points in order (any angle: vertical,
 //    sloped, horizontal ceilings/floors). Points live in mod.json (pvpzone_walls_<map>).
 //    Pieces are solid like real walls: block players, titans, NPCs, bullets, projectiles, splash and AI sight.
-//  - Optional script boundary (XY polygon) as a safety net, out-of-bounds countdown zones, in-area spawns
-//    (pvpzone_maps.nut).
+//  - Play area (pvpzone_boundary_<map> in mod.json): leaving it = instant "fell out of the map" death.
+//    Covers players (pilot, titan, rodeo), NPC titans are moved back inside, other NPCs die.
+//  - Out-of-bounds countdown zones and custom spawns (pvpzone_maps.nut).
 //  - Edit tools in game (pvpzone_edit 1): aim and record points, build a preview wall instantly, print config.
 
 global function PvPZone_Init
@@ -44,7 +45,11 @@ struct
 	array<vector> customSpawnOrigins
 	array<vector> customSpawnAngles
 	array<vector> safeSpawns
+	array<vector> titanSafeSpawns
 	bool warnedNoSafeSpawn = false
+	bool fallMode = true
+	bool ceilingKill = false
+	int npcCheckFrame = 0
 
 	// energy walls
 	asset wallModel
@@ -212,6 +217,11 @@ bool function PvPZone_PointInArea( vector p, PvPZoneArea area )
 {
 	if ( p.z < area.minZ || p.z > area.maxZ )
 		return false
+	return PvPZone_InsideXY( p, area )
+}
+
+bool function PvPZone_InsideXY( vector p, PvPZoneArea area )
+{
 	if ( p.x < area.bbMins.x || p.x > area.bbMaxs.x || p.y < area.bbMins.y || p.y > area.bbMaxs.y )
 		return false
 
@@ -579,17 +589,30 @@ void function PvPZone_Setup_Threaded()
 		PvPZone_ComputeBlockedSpawns()
 	}
 
+	PvPZone_LoadBoundaryFromConVar()
 	if ( !file.hasBoundary )
 	{
-		printt( "[PvPZone] no script boundary for " + GetMapName() + " (walls only)" )
+		printt( "[PvPZone] no play area for " + GetMapName() + " (walls only, nothing is lethal)" )
 		return
 	}
+
+	file.fallMode = strip( GetConVarString( "pvpzone_boundary_mode" ) ).tolower() != "push"
+	file.ceilingKill = GetConVarBool( "pvpzone_ceiling_kill" )
+	printt( "[PvPZone] play area: " + file.boundary.poly.len() + " points, z " + int( file.boundary.minZ ) + " .. " + int( file.boundary.maxZ )
+		+ ", outside = " + ( file.fallMode ? "fall death" : "push back" ) )
 
 	foreach ( entity spawnpoint in GetEntArrayByClass_Expensive( "info_spawnpoint_human" ) )
 	{
 		if ( PvPZone_SpawnRule( spawnpoint, TEAM_UNASSIGNED ) )
 			file.safeSpawns.append( spawnpoint.GetOrigin() )
 	}
+	foreach ( entity spawnpoint in GetEntArrayByClass_Expensive( "info_spawnpoint_titan" ) )
+	{
+		if ( PvPZone_SpawnRule( spawnpoint, TEAM_UNASSIGNED ) )
+			file.titanSafeSpawns.append( spawnpoint.GetOrigin() )
+	}
+	if ( file.titanSafeSpawns.len() == 0 )
+		file.titanSafeSpawns = clone file.safeSpawns
 	printt( "[PvPZone] " + file.safeSpawns.len() + " pilot spawns inside the play area" )
 	if ( file.safeSpawns.len() < 8 )
 		printt( "[PvPZone] WARNING: few spawns inside the area, add more with pvpzone_spawn / PvPZone_AddSpawn" )
@@ -598,6 +621,39 @@ void function PvPZone_Setup_Threaded()
 		PvPZone_CullOutside()
 
 	thread PvPZone_Think()
+}
+
+// pvpzone_boundary_<map> = "x y z, x y z, x y z, ..." (corners in order, on the ground)
+// floor  = lowest point - pvpzone_boundary_below, ceiling = highest point + pvpzone_boundary_above
+void function PvPZone_LoadBoundaryFromConVar()
+{
+	string mapName = GetMapName()
+	if ( !PvPZone_KnownMap( mapName ) )
+		return
+	string data = GetConVarString( "pvpzone_boundary_" + mapName )
+	if ( strip( data ) == "" )
+		return
+
+	array<array<vector> > parsed = PvPZone_ParseSurfaces( data )
+	if ( parsed.len() == 0 )
+	{
+		printt( "[PvPZone] pvpzone_boundary_" + mapName + " needs at least 3 points" )
+		return
+	}
+	if ( parsed.len() > 1 )
+		printt( "[PvPZone] pvpzone_boundary_" + mapName + " has several parts, only the first is used" )
+
+	array<vector> pts = parsed[0]
+	float zLow = pts[0].z
+	float zHigh = pts[0].z
+	foreach ( vector p in pts )
+	{
+		zLow = min( zLow, p.z )
+		zHigh = max( zHigh, p.z )
+	}
+
+	file.boundary = PvPZone_MakeArea( pts, zLow - GetConVarFloat( "pvpzone_boundary_below" ), zHigh + GetConVarFloat( "pvpzone_boundary_above" ), 0.0 )
+	file.hasBoundary = true
 }
 
 void function PvPZone_CullOutside()
@@ -716,12 +772,63 @@ void function PvPZone_Think()
 				continue
 			PvPZone_CheckPlayer( player )
 		}
+
+		// NPCs walk slower than players dash: every 10 frames is enough
+		file.npcCheckFrame++
+		if ( file.npcCheckFrame >= 10 )
+		{
+			file.npcCheckFrame = 0
+			PvPZone_CheckNPCs()
+		}
 	}
+}
+
+void function PvPZone_CheckNPCs()
+{
+	foreach ( entity npc in GetNPCArray() )
+	{
+		if ( !IsAlive( npc ) || npc.Anim_IsActive() || IsValid( npc.GetParent() ) )
+			continue
+		if ( npc.IsTitan() && npc.e.isHotDropping )
+			continue
+		if ( PvPZone_PointInArea( npc.GetOrigin(), file.boundary ) )
+			continue
+
+		if ( npc.IsTitan() )
+		{
+			// auto-titans / titans that fell outside the area are moved back, not killed
+			if ( file.titanSafeSpawns.len() > 0 )
+			{
+				npc.SetOrigin( file.titanSafeSpawns.getrandom() )
+				npc.SetVelocity( < 0, 0, 0 > )
+			}
+		}
+		else
+		{
+			npc.Die( svGlobal.worldspawn, svGlobal.worldspawn, { damageSourceId = eDamageSourceId.fall, scriptType = DF_INSTANT } )
+		}
+	}
+}
+
+// same as the map's own "fell out of the world" trigger: black screen + fall death
+void function PvPZone_FallDeath( entity player )
+{
+	if ( player.IsGodMode() )
+		return
+	ScreenFade( player, 0, 0, 0, 255, 0.2, 1.0, FFADE_OUT | FFADE_PURGE )
+	KillPlayer( player, eDamageSourceId.fall )
 }
 
 void function PvPZone_CheckPlayer( entity player )
 {
-	if ( player.IsNoclipping() || player.Anim_IsActive() || IsValid( player.GetParent() ) )
+	// scripted animations (executions, embark, rodeo mount) and the intro/evac dropship are skipped;
+	// the check resumes the frame they end. Rodeo riders are parented to a titan and still checked.
+	if ( player.Anim_IsActive() )
+		return
+	if ( player.IsNoclipping() ) // needs sv_cheats, same exemption as the native OOB system
+		return
+	entity parent = player.GetParent()
+	if ( IsValid( parent ) && IsDropship( parent ) )
 		return
 
 	vector pos = player.GetOrigin()
@@ -733,6 +840,20 @@ void function PvPZone_CheckPlayer( entity player )
 			file.lastSafe[ player ] <- pos
 
 		PvPZone_UpdateOOB( player, pos )
+		return
+	}
+
+	if ( file.fallMode && player in file.lastSafe )
+	{
+		// above the ceiling but still over the area: not lethal unless pvpzone_ceiling_kill 1
+		if ( !file.ceilingKill && pos.z > file.boundary.maxZ && PvPZone_InsideXY( pos, file.boundary ) )
+		{
+			vector vel = player.GetVelocity()
+			if ( vel.z > 0.0 )
+				player.SetVelocity( < vel.x, vel.y, 0.0 > )
+			return
+		}
+		PvPZone_FallDeath( player )
 		return
 	}
 
@@ -1007,14 +1128,17 @@ bool function PvPZone_CC_Print( entity player, array<string> args )
 
 	string kind = args.len() > 0 ? args[0] : "wall"
 
-	if ( kind == "wall" )
+	if ( kind == "wall" || kind == "boundary" )
 	{
 		string s = ""
 		for ( int i = 0; i < pts.len(); i++ )
 			s += ( i > 0 ? ", " : "" ) + PvPZone_PointStr( pts[i] )
-		printt( "[PvPZone] ---- surface for \"pvpzone_walls_" + GetMapName() + "\" in mod.json (separate surfaces with ;) ----" )
+		if ( kind == "wall" )
+			printt( "[PvPZone] ---- surface for \"pvpzone_walls_" + GetMapName() + "\" in mod.json (separate surfaces with ;) ----" )
+		else
+			printt( "[PvPZone] ---- play area for \"pvpzone_boundary_" + GetMapName() + "\" in mod.json ----" )
 		printt( s )
-		PvPZone_Tell( player, "wall surface (" + pts.len() + " points) printed to the console" )
+		PvPZone_Tell( player, kind + " (" + pts.len() + " points) printed to the console" )
 		return true
 	}
 
